@@ -9,13 +9,14 @@
 // Example single entry (conceptual):
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
+#include "index.h"
 #include "tree.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
 #define MODE_FILE      0100644
@@ -129,9 +130,145 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+static int name_already_added(char names[][256], int count, const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(names[i], name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int build_tree_recursive(const Index *index, const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    char seen_dirs[MAX_TREE_ENTRIES][256];
+    int seen_dir_count = 0;
+
+    size_t prefix_len = strlen(prefix);
+
+    for (int i = 0; i < index->count; i++) {
+        const char *full_path = index->entries[i].path;
+        const char *rest = full_path;
+
+        if (prefix_len > 0) {
+            if (strncmp(full_path, prefix, prefix_len) != 0) {
+                continue;
+            }
+            rest = full_path + prefix_len;
+        }
+
+        if (*rest == '\0') continue;
+
+        const char *slash = strchr(rest, '/');
+
+        if (!slash) {
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+
+            TreeEntry *e = &tree.entries[tree.count++];
+            e->mode = index->entries[i].mode;
+            e->hash = index->entries[i].hash;
+            snprintf(e->name, sizeof(e->name), "%s", rest);
+        } else {
+            char dirname[256];
+            size_t dirlen = (size_t)(slash - rest);
+            if (dirlen == 0 || dirlen >= sizeof(dirname)) return -1;
+
+            memcpy(dirname, rest, dirlen);
+            dirname[dirlen] = '\0';
+
+            if (name_already_added(seen_dirs, seen_dir_count, dirname)) {
+                continue;
+            }
+
+            if (seen_dir_count >= MAX_TREE_ENTRIES) return -1;
+            snprintf(seen_dirs[seen_dir_count++], 256, "%s", dirname);
+
+            char child_prefix[1024];
+            snprintf(child_prefix, sizeof(child_prefix), "%s%s/", prefix, dirname);
+
+            ObjectID child_tree_id;
+            if (build_tree_recursive(index, child_prefix, &child_tree_id) != 0) {
+                return -1;
+            }
+
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+
+            TreeEntry *e = &tree.entries[tree.count++];
+            e->mode = MODE_DIR;
+            e->hash = child_tree_id;
+            snprintf(e->name, sizeof(e->name), "%s", dirname);
+        }
+    }
+
+    if (tree.count == 0) {
+        char dummy = 0;
+        return object_write(OBJ_TREE, &dummy, 0, id_out);
+    }
+
+    void *data = NULL;
+    size_t len = 0;
+    if (tree_serialize(&tree, &data, &len) != 0) {
+        return -1;
+    }
+
+    int rc = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return rc;
+}
+
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    if (!id_out) return -1;
+
+    Index index;
+    index.count = 0;
+
+    FILE *fp = fopen(INDEX_FILE, "r");
+    if (!fp) {
+        /* No index file yet -> empty tree */
+        char dummy = 0;
+        return object_write(OBJ_TREE, &dummy, 0, id_out);
+    }
+
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        if (index.count >= MAX_INDEX_ENTRIES) {
+            fclose(fp);
+            return -1;
+        }
+
+        IndexEntry *e = &index.entries[index.count];
+
+        char hash_hex[HASH_HEX_SIZE + 1];
+        unsigned long long mtime_tmp;
+        unsigned int size_tmp;
+
+        int scanned = sscanf(
+            line,
+            "%o %64s %llu %u %511[^\n]",
+            &e->mode,
+            hash_hex,
+            &mtime_tmp,
+            &size_tmp,
+            e->path
+        );
+
+        if (scanned != 5) {
+            fclose(fp);
+            return -1;
+        }
+
+        if (hex_to_hash(hash_hex, &e->hash) != 0) {
+            fclose(fp);
+            return -1;
+        }
+
+        e->mtime_sec = (uint64_t)mtime_tmp;
+        e->size = (uint32_t)size_tmp;
+        index.count++;
+    }
+
+    fclose(fp);
+
+    return build_tree_recursive(&index, "", id_out);
 }
