@@ -10,7 +10,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
+#include <stddef.h>
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 // ─── PROVIDED: Command Implementations ──────────────────────────────────────
 
 // Usage: pes init
@@ -52,6 +53,10 @@ void cmd_add(int argc, char *argv[]) {
             fprintf(stderr, "error: failed to add '%s'\n", argv[i]);
         }
     }
+	if (index_save(&index) != 0) {
+	 fprintf(stderr, "error: failed to save index\n");
+	 return;
+}
 }
 
 // Usage: pes status

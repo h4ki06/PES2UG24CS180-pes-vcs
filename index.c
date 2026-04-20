@@ -13,8 +13,8 @@
 // what will go into the next commit) and ATOMIC WRITES (temp+rename).
 //
 // PROVIDED functions: index_find, index_remove, index_status
-// TODO functions:     index_load, index_save, index_add
-
+// TODO functions:     index_load, index_save, index_
+#include <errno.h>
 #include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +23,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <stddef.h>
 
+
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -134,13 +137,9 @@ int index_status(const Index *index) {
 //   - hex_to_hash                      : converting the parsed string to ObjectID
 //
 // Returns 0 on success, -1 on error.
-int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
-}
 
+
+        
 // Save the index to .pes/index atomically.
 //
 // HINTS - Useful functions and syscalls:
@@ -150,13 +149,6 @@ int index_load(Index *index) {
 //   - fflush, fileno, fsync, fclose    : flushing userspace buffers and syncing to disk
 //   - rename                           : atomically moving the temp file over the old index
 //
-// Returns 0 on success, -1 on error.
-int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
-}
 
 // Stage a file for the next commit.
 //
@@ -166,10 +158,190 @@ int index_save(const Index *index) {
 //   - stat / lstat                     : getting file metadata (size, mtime, mode)
 //   - index_find                       : checking if the file is already staged
 //
-// Returns 0 on success, -1 on error.
+// Returns 0 on success, -1 on err
+int index_load(Index *index) {
+    if (!index) return -1;
+
+    index->count = 0;
+
+    FILE *fp = fopen(INDEX_FILE, "r");
+    if (!fp) {
+        /* No index file yet -> empty index */
+        return 0;
+    }
+
+    char line[2048];
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fclose(fp);
+            return -1;
+        }
+
+        IndexEntry *e = &index->entries[index->count];
+
+        char hash_hex[HASH_HEX_SIZE + 1];
+        unsigned long long mtime_tmp;
+        unsigned int size_tmp;
+
+        int scanned = sscanf(
+            line,
+            "%o %64s %llu %u %511[^\n]",
+            &e->mode,
+            hash_hex,
+            &mtime_tmp,
+            &size_tmp,
+            e->path
+        );
+
+        if (scanned != 5) {
+            fclose(fp);
+            return -1;
+        }
+
+        if (hex_to_hash(hash_hex, &e->hash) != 0) {
+            fclose(fp);
+            return -1;
+        }
+
+        e->mtime_sec = (uint64_t)mtime_tmp;
+        e->size = (uint32_t)size_tmp;
+
+        index->count++;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static int cmp_entries(const void *a, const void *b) {
+    const IndexEntry *ea = (const IndexEntry *)a;
+    const IndexEntry *eb = (const IndexEntry *)b;
+    return strcmp(ea->path, eb->path);
+}
+
+int index_save(const Index *index) {
+    if (!index) return -1;
+
+    mkdir(PES_DIR, 0755);
+
+    char tmp_path[] = ".pes/index.tmp";
+    FILE *fp = fopen(tmp_path, "w");
+    if (!fp) return -1;
+
+    Index sorted = *index;
+    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), cmp_entries);
+
+    for (int i = 0; i < sorted.count; i++) {
+        const IndexEntry *e = &sorted.entries[i];
+        char hash_hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&e->hash, hash_hex);
+
+        if (fprintf(fp, "%o %s %llu %u %s\n",
+                    e->mode,
+                    hash_hex,
+                    (unsigned long long)e->mtime_sec,
+                    (unsigned int)e->size,
+                    e->path) < 0) {
+            fclose(fp);
+            unlink(tmp_path);
+            return -1;
+        }
+    }
+
+    if (fflush(fp) != 0) {
+        fclose(fp);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (fclose(fp) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (rename(tmp_path, INDEX_FILE) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    return 0;
+}
+
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    if (!index || !path) return -1;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    long size_long = ftell(fp);
+    if (size_long < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t size = (size_t)size_long;
+    void *data = malloc(size > 0 ? size : 1);
+    if (!data) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t nread = fread(data, 1, size, fp);
+    fclose(fp);
+
+    if (nread != size) {
+        free(data);
+        return -1;
+    }
+
+    ObjectID id;
+    if (object_write(OBJ_BLOB, data, size, &id) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < index->count; i++) {
+        if (strcmp(index->entries[i].path, path) == 0) {
+            index->entries[i].mode = 0100644;
+            index->entries[i].hash = id;
+            index->entries[i].mtime_sec = (uint64_t)st.st_mtime;
+            index->entries[i].size = (uint32_t)st.st_size;
+            return 0;
+        }
+    }
+
+    if (index->count >= MAX_INDEX_ENTRIES) return -1;
+
+    IndexEntry *e = &index->entries[index->count++];
+    e->mode = 0100644;
+    e->hash = id;
+    e->mtime_sec = (uint64_t)st.st_mtime;
+    e->size = (uint32_t)st.st_size;
+    snprintf(e->path, sizeof(e->path), "%s", path);
+
+    return 0;
 }
